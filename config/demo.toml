@@ -1,0 +1,23 @@
+[reconciliation]
+currency = "INR"
+grace_period_hours = 72
+rule_version = "1.0.0"
+config_version = "1.0.0"
+schema_version = "1.0.0"
+tolerance_minor = 0
+
+[pipeline]
+batch_size = 1000
+log_level = "INFO"
+application_lock_id = 428910001
+
+[database]
+# Environment variable names for role DSNs (never hardcode credentials)
+migration_dsn_env = "RECON_MIGRATION_DSN"
+pipeline_dsn_env = "RECON_PIPELINE_DSN"
+dashboard_dsn_env = "RECON_DASHBOARD_DSN"
+
+# Test environment variable names
+test_migration_dsn_env = "RECON_TEST_MIGRATION_DSN"
+test_pipeline_dsn_env = "RECON_TEST_PIPELINE_DSN"
+test_dashboard_dsn_env = "RECON_TEST_DASHBOARD_DSN"
