@@ -1,0 +1,4 @@
+settlement_entry_id,payout_id,transaction_id,entry_type,gross_minor,fee_minor,net_minor,currency,settled_at
+stl_501,po_601,txn_301,payment,500000,10000,490000,INR,2026-01-02T04:00:00Z
+stl_502,po_601,txn_302,payment,200000,4000,196000,INR,2026-01-02T04:00:00Z
+stl_503,po_601,rf_303,refund,-50000,0,-50000,INR,2026-01-02T04:00:00Z

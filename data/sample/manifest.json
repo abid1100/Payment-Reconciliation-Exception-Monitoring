@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0.0",
+  "batch_id": "batch_sample_001",
+  "scenario": "sample_baseline_with_edge_cases",
+  "seed": 42,
+  "base_time": "2026-01-01T00:00:00Z",
+  "delivered_at": "2026-01-03T10:00:00Z",
+  "files": [
+    {
+      "filename": "orders.csv",
+      "source_name": "orders",
+      "record_count": 4,
+      "sha256_hex": "001ae298e1060818407259d4ea48e8a6f51129f133fe3c12a34eac396b9af041"
+    },
+    {
+      "filename": "payment_events.jsonl",
+      "source_name": "payment_events",
+      "record_count": 6,
+      "sha256_hex": "138214fc6742e4aa16c99fb800606db37f62cb0160c888737fcc99198763ff93"
+    },
+    {
+      "filename": "settlement_entries.csv",
+      "source_name": "settlement_entries",
+      "record_count": 3,
+      "sha256_hex": "8269ce20c349909d47dc16b3044a43212f75bc51d6c2847f47bad5398c600041"
+    },
+    {
+      "filename": "payouts.csv",
+      "source_name": "payouts",
+      "record_count": 1,
+      "sha256_hex": "4d9a1936b2f47d4855b1354f83d4451d483c8927226e1583a66545add3c2b8ba"
+    }
+  ]
+}
