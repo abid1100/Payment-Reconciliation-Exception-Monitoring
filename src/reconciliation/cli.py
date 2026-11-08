@@ -19,14 +19,16 @@ def build_parser() -> argparse.ArgumentParser:
     # 1. generate
     gen_parser = subparsers.add_parser("generate", help="Generate synthetic reproducible batch")
     gen_parser.add_argument("--scenario", default="baseline", help="Scenario name (e.g. baseline, sample_baseline_with_edge_cases)")
-    gen_parser.add_argument("--seed", type=int, default=42, help="Deterministic random seed")
+    gen_parser.add_argument("--seed", type=int, default=42, help="Provenance seed label (baseline fixture is fixed)")
     gen_parser.add_argument("--base-time", default="2026-01-01T00:00:00Z", help="Base timestamp (ISO-8601 UTC)")
     gen_parser.add_argument("--output", required=True, help="Output directory path")
     gen_parser.add_argument("--batch-id", default=None, help="Explicit batch ID")
+    gen_parser.add_argument("--overwrite", action="store_true", help="Explicitly replace generated files in nonempty output")
 
     # 2. validate
     val_parser = subparsers.add_parser("validate", help="Validate batch files against contracts and manifest")
     val_parser.add_argument("--input", required=True, help="Directory containing batch files and manifest.json")
+    val_parser.add_argument("--as-of", default=None, help="Optional timezone-aware evaluation cutoff")
 
     # 3. migrate
     mig_parser = subparsers.add_parser("migrate", help="Apply versioned schema migrations")
@@ -53,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _dispatch(argv)
+    except (ValueError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -64,14 +74,17 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             base_time=args.base_time,
             batch_id=args.batch_id,
+            overwrite=args.overwrite,
         )
         print(f"Success! Generated batch '{manifest['batch_id']}' with {len(manifest['files'])} files.")
         return 0
 
     if args.command == "validate":
-        from reconciliation.ingest import validate_batch_files
+        from reconciliation.batch import prepare_batch
         print(f"Validating batch in {args.input}...")
-        errors = validate_batch_files(args.input)
+        prepared = prepare_batch(args.input, as_of=args.as_of)
+        errors = [f"{file.filename} line {row.line_number}: {error}"
+                  for file in prepared.files for row in file.rows for error in row.errors]
         if errors:
             print("Validation FAILED with the following errors:")
             for err in errors:
@@ -83,27 +96,38 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "migrate":
         from reconciliation.migrate import run_migrations
         config = AppConfig.load(args.config)
-        dsn = config.get_dsn("migration", is_test=args.is_test) if not args.connection_env else config.get_dsn(args.connection_env)
+        dsn = config.get_dsn("migration", is_test=args.is_test, connection_env=args.connection_env)
         print("Applying migrations...")
-        applied = run_migrations(dsn)
+        applied = run_migrations(dsn, lock_id=config.policy.application_lock_id)
         print(f"Applied {applied} migrations successfully.")
         return 0
 
     if args.command == "run":
         from reconciliation.pipeline import run_pipeline_batch
         config = AppConfig.load(args.config)
-        dsn = config.get_dsn("pipeline", is_test=args.is_test) if not args.connection_env else config.get_dsn(args.connection_env)
+        dsn = config.get_dsn("pipeline", is_test=args.is_test, connection_env=args.connection_env)
         print(f"Running pipeline batch from {args.input} as of {args.as_of}...")
-        result = run_pipeline_batch(input_dir=args.input, as_of_time=args.as_of, config=config, dsn=dsn)
+        result = run_pipeline_batch(
+            input_dir=args.input,
+            as_of_time=args.as_of,
+            config=config,
+            dsn=dsn,
+            is_test=args.is_test,
+        )
         print(f"Pipeline finished with status: {result['status']}")
         return 0 if result["status"] == "SUCCEEDED" else 1
 
     if args.command == "evaluate":
         from reconciliation.pipeline import evaluate_existing_state
         config = AppConfig.load(args.config)
-        dsn = config.get_dsn("pipeline", is_test=args.is_test) if not args.connection_env else config.get_dsn(args.connection_env)
+        dsn = config.get_dsn("pipeline", is_test=args.is_test, connection_env=args.connection_env)
         print(f"Re-evaluating reconciliation as of {args.as_of}...")
-        result = evaluate_existing_state(as_of_time=args.as_of, config=config, dsn=dsn)
+        result = evaluate_existing_state(
+            as_of_time=args.as_of,
+            config=config,
+            dsn=dsn,
+            is_test=args.is_test,
+        )
         print(f"Evaluation finished with status: {result['status']}")
         return 0 if result["status"] == "SUCCEEDED" else 1
 

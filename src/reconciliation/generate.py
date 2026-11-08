@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from reconciliation.contracts import parse_utc_timestamp, validate_identifier
+
 
 def calculate_sha256(filepath: Path) -> str:
     """Compute SHA-256 hex digest of file bytes."""
@@ -24,14 +26,35 @@ def generate_batch(
     seed: int = 42,
     base_time: str = "2026-01-01T00:00:00Z",
     batch_id: str | None = None,
+    *,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Generate deterministic batch files and accompanying manifest.json."""
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    """Generate the fixed hand-checkable v1 fixture (both scenario aliases).
 
-    base_dt = datetime.datetime.fromisoformat(base_time.replace("Z", "+00:00")).astimezone(datetime.timezone.utc)
-    if not batch_id:
+    Seed labels provenance only: it does not randomize the fixture. Default
+    identity is batch_{scenario}_{seed}; changing base_time under that identity
+    is a different payload, so use an explicit new batch_id for a new batch.
+    CSV uses CRLF; JSONL and manifest use LF on every platform. Overwrite updates
+    only these five generated files, never removes unrelated output files.
+    """
+    if scenario not in ("baseline", "sample_baseline_with_edge_cases"):
+        raise ValueError("Unsupported generator scenario")
+    if type(seed) is not int:
+        raise ValueError("seed must be an integer")
+    if not isinstance(base_time, str):
+        raise ValueError("base_time must be an ISO-8601 timestamp string")
+    base_dt = parse_utc_timestamp(base_time, "base_time")
+    try:
+        delivered_at = base_dt + datetime.timedelta(days=2, hours=10)
+    except OverflowError:
+        raise ValueError("base_time is too late for the fixture timestamps") from None
+    if batch_id is None:
         batch_id = f"batch_{scenario}_{seed}"
+    validate_identifier(batch_id, "batch_id")
+    out = Path(output_dir)
+    if out.exists() and any(out.iterdir()) and not overwrite:
+        raise ValueError("Output directory is nonempty; pass overwrite=True or --overwrite explicitly")
+    out.mkdir(parents=True, exist_ok=True)
 
     orders: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
@@ -188,7 +211,7 @@ def generate_batch(
         writer.writerows(orders)
 
     events_path = out / "payment_events.jsonl"
-    with open(events_path, "w", encoding="utf-8") as f:
+    with open(events_path, "w", newline="\n", encoding="utf-8") as f:
         for ev in events:
             f.write(json.dumps(ev) + "\n")
 
@@ -246,12 +269,12 @@ def generate_batch(
         "scenario": scenario,
         "seed": seed,
         "base_time": base_time,
-        "delivered_at": (base_dt + datetime.timedelta(days=2, hours=10)).isoformat(),
+        "delivered_at": delivered_at.isoformat(),
         "files": manifest_files,
     }
 
     manifest_path = out / "manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
+    with open(manifest_path, "w", newline="\n", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
     return manifest

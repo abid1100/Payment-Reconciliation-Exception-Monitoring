@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -12,14 +13,16 @@ def parse_utc_timestamp(value: Any, field_name: str) -> datetime.datetime:
     Rejects naive timestamps without explicit timezone.
     """
     if isinstance(value, datetime.datetime):
-        if value.tzinfo is None:
+        if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(f"{field_name} must be timezone-aware.")
         return value.astimezone(datetime.timezone.utc)
 
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})", value
+    ):
         raise ValueError(f"{field_name} must be a non-empty ISO-8601 timestamp string.")
 
-    cleaned = value.strip()
+    cleaned = value
     try:
         # Support trailing 'Z'
         if cleaned.endswith("Z"):
@@ -47,9 +50,9 @@ def parse_integer_minor(value: Any, field_name: str, allow_negative: bool = Fals
         raise ValueError(f"{field_name} floating-point values are rejected to prevent precision loss: {value}")
 
     if isinstance(value, str):
-        cleaned = value.strip()
-        if "." in cleaned:
-            raise ValueError(f"{field_name} must be an integer minor unit, fractional strings rejected: '{value}'")
+        cleaned = value
+        if not re.fullmatch(r"[+-]?[0-9]+", cleaned):
+            raise ValueError(f"{field_name} must be an ordinary signed decimal integer string")
         try:
             val = int(cleaned)
         except ValueError as e:
@@ -59,6 +62,8 @@ def parse_integer_minor(value: Any, field_name: str, allow_negative: bool = Fals
     else:
         raise ValueError(f"{field_name} must be an integer, got {type(value).__name__}: {value}")
 
+    if not -(2**63) <= val <= 2**63 - 1:
+        raise ValueError(f"{field_name} must fit signed BIGINT")
     if not allow_negative and val < 0:
         raise ValueError(f"{field_name} must be non-negative, got: {val}")
 
@@ -67,14 +72,14 @@ def parse_integer_minor(value: Any, field_name: str, allow_negative: bool = Fals
 
 def validate_identifier(value: Any, field_name: str) -> str:
     """Validate opaque string identifier."""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field_name} must be a non-empty string identifier.")
-    return value.strip()
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", value):
+        raise ValueError(f"{field_name} must be an ASCII identifier of 1 to 64 characters")
+    return value
 
 
 def validate_currency(value: Any, field_name: str, expected_currency: str = "INR") -> str:
     """Validate ISO-4217 currency code."""
-    if not isinstance(value, str) or value.strip().upper() != expected_currency:
+    if not isinstance(value, str) or value != expected_currency or expected_currency != "INR":
         raise ValueError(f"{field_name} must be '{expected_currency}', got '{value}'")
     return expected_currency
 
@@ -101,7 +106,7 @@ class OrderRecord:
         return cls(order_id=order_id, amount_minor=amount, currency=currency, ordered_at=ordered_at)
 
     def business_payload(self) -> dict[str, Any]:
-        return {"amount_minor": self.amount_minor, "currency": self.currency}
+        return {"amount_minor": self.amount_minor, "currency": self.currency, "ordered_at": self.ordered_at.isoformat()}
 
 
 @dataclass(frozen=True)
@@ -119,7 +124,7 @@ class PaymentEventRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PaymentEventRecord:
         event_id = validate_identifier(data.get("event_id"), "event_id")
-        event_type = str(data.get("event_type", "")).strip().lower()
+        event_type = data.get("event_type")
         if event_type not in ("payment_captured", "refund_succeeded"):
             raise ValueError(f"event_type must be 'payment_captured' or 'refund_succeeded', got: '{event_type}'")
 
@@ -189,7 +194,7 @@ class SettlementEntryRecord:
         entry_id = validate_identifier(data.get("settlement_entry_id"), "settlement_entry_id")
         payout_id = validate_identifier(data.get("payout_id"), "payout_id")
         txn_id = validate_identifier(data.get("transaction_id"), "transaction_id")
-        entry_type = str(data.get("entry_type", "")).strip().lower()
+        entry_type = data.get("entry_type")
         if entry_type not in ("payment", "refund"):
             raise ValueError(f"entry_type must be 'payment' or 'refund', got: '{entry_type}'")
 
@@ -204,6 +209,8 @@ class SettlementEntryRecord:
             raise ValueError(f"payment settlement line gross must be positive (>0), got: {gross}")
         if entry_type == "refund" and gross >= 0:
             raise ValueError(f"refund settlement line gross must be negative (<0), got: {gross}")
+        if entry_type == "refund" and fee != 0:
+            raise ValueError("refund settlement fee_minor must be zero")
 
         return cls(
             settlement_entry_id=entry_id,
@@ -226,6 +233,7 @@ class SettlementEntryRecord:
             "fee_minor": self.fee_minor,
             "net_minor": self.net_minor,
             "currency": self.currency,
+            "settled_at": self.settled_at.isoformat(),
         }
 
 
@@ -242,6 +250,8 @@ class PayoutRecord:
         payout_id = validate_identifier(data.get("payout_id"), "payout_id")
         amount = parse_integer_minor(data.get("amount_minor"), "amount_minor", allow_negative=True)
         expected_count = parse_integer_minor(data.get("expected_entry_count"), "expected_entry_count", allow_negative=False)
+        if expected_count > 2**31 - 1:
+            raise ValueError("expected_entry_count must fit signed INTEGER")
         currency = validate_currency(data.get("currency"), "currency")
         issued_at = parse_utc_timestamp(data.get("issued_at"), "issued_at")
         return cls(
@@ -257,6 +267,7 @@ class PayoutRecord:
             "amount_minor": self.amount_minor,
             "expected_entry_count": self.expected_entry_count,
             "currency": self.currency,
+            "issued_at": self.issued_at.isoformat(),
         }
 
 
@@ -280,32 +291,54 @@ class BatchManifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BatchManifest:
-        schema_version = str(data.get("schema_version", "")).strip()
+        if not isinstance(data, dict):
+            raise ValueError("Manifest must be an object")
+        schema_version = data.get("schema_version")
         if schema_version != "1.0.0":
             raise ValueError(f"Unsupported schema_version: '{schema_version}'. Expected '1.0.0'.")
 
         batch_id = validate_identifier(data.get("batch_id"), "batch_id")
         scenario = validate_identifier(data.get("scenario"), "scenario")
-        seed = int(data.get("seed", 0))
+        seed = data.get("seed")
+        if type(seed) is not int:
+            raise ValueError("Manifest seed must be an integer")
         base_time = parse_utc_timestamp(data.get("base_time"), "base_time")
         delivered_at = parse_utc_timestamp(data.get("delivered_at"), "delivered_at")
+        if base_time > delivered_at:
+            raise ValueError("Manifest base_time cannot exceed delivered_at")
 
         raw_files = data.get("files")
         if not isinstance(raw_files, list) or len(raw_files) == 0:
             raise ValueError("Manifest must contain a non-empty 'files' array.")
 
         files: list[ManifestFileEntry] = []
+        filenames: set[str] = set()
+        sources: set[str] = set()
         for f in raw_files:
+            if not isinstance(f, dict):
+                raise ValueError("Manifest file entry must be an object")
             fn = validate_identifier(f.get("filename"), "filename")
             # Path traversal prevention
-            if "/" in fn or "\\" in fn or ".." in fn:
+            if "/" in fn or "\\" in fn or ".." in fn or fn.endswith(".") or re.fullmatch(
+                r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", fn, flags=re.IGNORECASE
+            ):
                 raise ValueError(f"Path traversal characters forbidden in manifest filename: '{fn}'")
 
-            sn = validate_identifier(f.get("source_name"), "source_name")
-            rc = parse_integer_minor(f.get("record_count"), "record_count", allow_negative=False)
-            h = validate_identifier(f.get("sha256_hex"), "sha256_hex").lower()
-            if len(h) != 64:
-                raise ValueError(f"Invalid SHA-256 hex digest length for file '{fn}': '{h}'")
+            sn = f.get("source_name")
+            if sn not in ("orders", "payment_events", "settlement_entries", "payouts"):
+                raise ValueError("Unknown manifest source_name")
+            # Case-insensitive file uniqueness is portable to Windows filesystems;
+            # business IDs and source names themselves remain case-sensitive.
+            if fn.casefold() in filenames or sn in sources:
+                raise ValueError("Manifest filenames and sources must be unique")
+            filenames.add(fn.casefold())
+            sources.add(sn)
+            rc = f.get("record_count")
+            if type(rc) is not int or rc < 0:
+                raise ValueError("Manifest record_count must be a nonnegative integer")
+            h = f.get("sha256_hex")
+            if not isinstance(h, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", h):
+                raise ValueError(f"Invalid SHA-256 hex digest for file '{fn}'")
             files.append(ManifestFileEntry(filename=fn, source_name=sn, record_count=rc, sha256_hex=h))
 
         return cls(

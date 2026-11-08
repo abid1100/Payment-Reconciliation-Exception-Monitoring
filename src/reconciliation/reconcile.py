@@ -164,7 +164,8 @@ def evaluate_reconciliation(
                 t.transaction_id,
                 t.order_id,
                 t.occurred_at,
-                o.order_id AS matched_order_id
+                o.order_id AS matched_order_id,
+                COUNT(*) OVER (PARTITION BY t.order_id) AS capture_count
             FROM core.transactions t
             LEFT JOIN core.orders o
                 ON o.order_id = t.order_id
@@ -176,7 +177,13 @@ def evaluate_reconciliation(
         )
         for row in cur.fetchall():
             txn_id = row["transaction_id"]
-            if row["matched_order_id"]:
+            if row["matched_order_id"] and row["capture_count"] > 1:
+                results.append(ReconciliationResult(
+                    run_id=run_id, rule_id="PAYMENT_ORDER", subject_type="transaction",
+                    subject_id=txn_id, state="EXCEPTION", reason_code="MULTIPLE_CAPTURES_DETECTED",
+                    expected_value="1 capture", observed_value=str(row["capture_count"]),
+                    evaluated_at=as_of_dt))
+            elif row["matched_order_id"]:
                 results.append(
                     ReconciliationResult(
                         run_id=run_id,
@@ -223,11 +230,11 @@ def evaluate_reconciliation(
                 p.transaction_id AS parent_txn_id,
                 p.amount_minor AS parent_captured_amount,
                 p.occurred_at AS parent_occurred_at,
-                p.currency AS parent_currency
+                p.currency AS parent_currency,
+                p.transaction_type AS parent_transaction_type
             FROM core.transactions r
             LEFT JOIN core.transactions p
                 ON p.transaction_id = r.parent_payment_id
-               AND p.transaction_type = 'payment'
                AND p.loaded_run_sequence <= %s
             WHERE r.transaction_type = 'refund'
               AND r.loaded_run_sequence <= %s;
@@ -257,6 +264,12 @@ def evaluate_reconciliation(
                         evaluated_at=as_of_dt,
                     )
                 )
+            elif (row["parent_transaction_type"] != "payment"
+                  or row["refund_currency"] != row["parent_currency"]):
+                results.append(ReconciliationResult(
+                    run_id=run_id, rule_id="REFUND_PARENT", subject_type="transaction",
+                    subject_id=rf_id, state="EXCEPTION", reason_code="PARENT_INCOMPATIBLE",
+                    evidence={"parent_id": parent_id}, evaluated_at=as_of_dt))
             else:
                 if row["refund_occurred_at"] < row["parent_occurred_at"]:
                     results.append(
@@ -336,7 +349,8 @@ def evaluate_reconciliation(
                 COUNT(se.settlement_entry_id) AS stl_count,
                 MAX(se.settlement_entry_id) AS single_stl_id,
                 MAX(se.gross_minor) AS single_gross,
-                MAX(se.currency) AS single_currency
+                MAX(se.currency) AS single_currency,
+                MAX(se.entry_type) AS single_entry_type
             FROM core.transactions t
             LEFT JOIN core.settlement_entries se
                 ON se.transaction_id = t.transaction_id
@@ -370,7 +384,13 @@ def evaluate_reconciliation(
                     )
                 )
             elif count == 1:
-                if row["single_gross"] == expected_gross:
+                if (row["single_currency"] != row["currency"]
+                        or row["single_entry_type"] != row["transaction_type"]):
+                    results.append(ReconciliationResult(
+                        run_id=run_id, rule_id="TRANSACTION_SETTLEMENT", subject_type="transaction",
+                        subject_id=txn_id, state="EXCEPTION", reason_code="SETTLEMENT_INCOMPATIBLE",
+                        evidence={"settlement_entry_id": row["single_stl_id"]}, evaluated_at=as_of_dt))
+                elif row["single_gross"] == expected_gross:
                     results.append(
                         ReconciliationResult(
                             run_id=run_id,
@@ -430,7 +450,10 @@ def evaluate_reconciliation(
                 se.fee_minor,
                 se.net_minor,
                 se.settled_at,
-                t.transaction_id AS matched_txn_id
+                t.transaction_id AS matched_txn_id,
+                se.entry_type, se.currency,
+                t.transaction_type AS matched_txn_type,
+                t.currency AS matched_txn_currency
             FROM core.settlement_entries se
             LEFT JOIN core.transactions t
                 ON t.transaction_id = se.transaction_id
@@ -443,7 +466,13 @@ def evaluate_reconciliation(
             stl_id = row["settlement_entry_id"]
 
             # Rule 6
-            if row["matched_txn_id"]:
+            if row["matched_txn_id"] and (row["entry_type"] != row["matched_txn_type"]
+                    or row["currency"] != row["matched_txn_currency"]):
+                results.append(ReconciliationResult(
+                    run_id=run_id, rule_id="SETTLEMENT_TRANSACTION", subject_type="settlement_entry",
+                    subject_id=stl_id, state="EXCEPTION", reason_code="TRANSACTION_INCOMPATIBLE",
+                    evidence={"transaction_id": row["transaction_id"]}, evaluated_at=as_of_dt))
+            elif row["matched_txn_id"]:
                 results.append(
                     ReconciliationResult(
                         run_id=run_id,
@@ -605,8 +634,8 @@ def evaluate_reconciliation(
                         rule_id="PAYOUT_TOTAL",
                         subject_type="payout",
                         subject_id=p_id,
-                        state="PENDING",
-                        reason_code="AWAITING_COMPLETE_LINES",
+                        state=state,
+                        reason_code="AWAITING_COMPLETE_LINES" if state == "PENDING" else "PAYOUT_LINES_OVERDUE",
                         expected_value=str(row["payout_summary_amount"]),
                         observed_value=str(row["observed_net_total"]),
                         due_at=due_at,
@@ -628,6 +657,12 @@ def evaluate_reconciliation(
                     )
                 )
 
+                results.append(ReconciliationResult(
+                    run_id=run_id, rule_id="PAYOUT_TOTAL", subject_type="payout",
+                    subject_id=p_id, state="EXCEPTION", reason_code="PAYOUT_OVERCOUNTED_LINES",
+                    expected_value=str(row["payout_summary_amount"]),
+                    observed_value=str(row["observed_net_total"]), evaluated_at=as_of_dt))
+
         # -------------------------------------------------------------
         # Rule 10: SETTLEMENT_PAYOUT
         # -------------------------------------------------------------
@@ -637,7 +672,8 @@ def evaluate_reconciliation(
                 se.settlement_entry_id,
                 se.payout_id,
                 se.settled_at,
-                p.payout_id AS matched_payout_id
+                p.payout_id AS matched_payout_id,
+                se.currency, p.currency AS payout_currency
             FROM core.settlement_entries se
             LEFT JOIN core.payouts p
                 ON p.payout_id = se.payout_id
@@ -648,7 +684,12 @@ def evaluate_reconciliation(
         )
         for row in cur.fetchall():
             stl_id = row["settlement_entry_id"]
-            if row["matched_payout_id"]:
+            if row["matched_payout_id"] and row["currency"] != row["payout_currency"]:
+                results.append(ReconciliationResult(
+                    run_id=run_id, rule_id="SETTLEMENT_PAYOUT", subject_type="settlement_entry",
+                    subject_id=stl_id, state="EXCEPTION", reason_code="PAYOUT_CURRENCY_MISMATCH",
+                    evaluated_at=as_of_dt))
+            elif row["matched_payout_id"]:
                 results.append(
                     ReconciliationResult(
                         run_id=run_id,
@@ -686,23 +727,36 @@ def evaluate_reconciliation(
         cur.execute(
             """
             SELECT
-                canonical_id,
-                source_type,
-                rejection_reason
-            FROM raw.raw_records
-            WHERE parse_status = 'CONFLICT';
-            """
+                d.canonical_id,
+                r.source_type,
+                d.rejection_reason,
+                r.record_id
+            FROM raw.record_dispositions d
+            JOIN raw.raw_records r ON r.record_id = d.raw_record_id
+            WHERE d.run_id = %s AND d.disposition = 'CONFLICT';
+            """,
+            (run_id,),
         )
-        for row in cur.fetchall():
+        conflict_rows = cur.fetchall()
+
+        conflicts: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in conflict_rows:
+            key = (row["source_type"], row["canonical_id"] or "UNKNOWN")
+            item = conflicts.setdefault(key, {"reasons": set(), "record_ids": set()})
+            item["reasons"].add(row["rejection_reason"] or "Conflicting source payload")
+            if row.get("record_id") is not None:
+                item["record_ids"].add(row["record_id"])
+        for (source_type, subject_id), item in sorted(conflicts.items()):
             results.append(
                 ReconciliationResult(
                     run_id=run_id,
                     rule_id="SOURCE_CONFLICT",
-                    subject_type=row["source_type"],
-                    subject_id=row["canonical_id"] or "UNKNOWN",
+                    subject_type=source_type,
+                    subject_id=subject_id,
                     state="EXCEPTION",
                     reason_code="PAYLOAD_CONFLICT",
-                    observed_value=row["rejection_reason"],
+                    observed_value="; ".join(sorted(item["reasons"])),
+                    evidence={"record_ids": sorted(item["record_ids"])},
                     evaluated_at=as_of_dt,
                 )
             )
