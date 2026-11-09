@@ -20,6 +20,7 @@ from reconciliation.contracts import (
     SettlementEntryRecord,
     PayoutRecord,
 )
+from reconciliation.evidence import stage_batch_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,16 @@ def stage_raw_batch_evidence(
 
     manifest = batch.manifest
 
+    # Step 1: Explicit evidence transaction before row staging, file skipping, or all-invalid rejection.
+    # Persists source batch, manifest/file blobs and associations atomically.
+    if hasattr(conn, "transaction"):
+        with conn.transaction(savepoint_name="evidence"):
+            stage_batch_evidence(conn, batch)
+    else:
+        stage_batch_evidence(conn, batch)
+        if hasattr(conn, "commit"):
+            conn.commit()
+
     summary = IngestionSummary(
         batch_id=manifest.batch_id,
         files_processed=0,
@@ -222,32 +233,6 @@ def stage_raw_batch_evidence(
     seen_payouts: dict[str, dict[str, Any]] = {}
 
     with conn.cursor() as cur:
-        # Check for existing batch ID and enforce identical manifest hash
-        cur.execute(
-            "SELECT manifest_hash FROM raw.source_batches WHERE batch_id = %s;",
-            (manifest.batch_id,),
-        )
-        existing_batch = cur.fetchone()
-        if existing_batch is not None:
-            existing_hash = existing_batch.get("manifest_hash") if isinstance(existing_batch, dict) else existing_batch[0]
-            if existing_hash != batch.manifest_hash:
-                raise ValueError(
-                    f"Batch conflict: batch_id '{manifest.batch_id}' already ingested with different manifest "
-                    f"hash '{existing_hash}' vs '{batch.manifest_hash}'."
-                )
-            cur.execute(
-                "UPDATE raw.source_batches SET staged_at = CLOCK_TIMESTAMP() WHERE batch_id = %s;",
-                (manifest.batch_id,),
-            )
-        else:
-            cur.execute(
-                """
-                INSERT INTO raw.source_batches (batch_id, manifest_hash, schema_version, delivered_at)
-                VALUES (%s, %s, %s, %s);
-                """,
-                (manifest.batch_id, batch.manifest_hash, manifest.schema_version, manifest.delivered_at),
-            )
-
         for prep_file in batch.files:
             source_name = prep_file.source_name
             file_hash = prep_file.file_hash
@@ -263,7 +248,8 @@ def stage_raw_batch_evidence(
             for row in prep_file.rows:
                 summary.rows_seen += 1
                 line_number = row.line_number
-                raw_payload = row.raw_text
+                # Display payload safe for storage when raw input contains NUL characters
+                raw_payload = row.raw_text.replace("\x00", "\\0")
 
                 # Check if this physical row was already staged in raw.raw_records
                 cur.execute(

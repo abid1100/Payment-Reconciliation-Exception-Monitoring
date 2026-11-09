@@ -1,0 +1,2 @@
+[console_scripts]
+reconciliation = reconciliation.cli:main
